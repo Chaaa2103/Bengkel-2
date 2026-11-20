@@ -1,0 +1,658 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Smart Sports Facility Booking System - Progress II cloud infrastructure.
+  VPC (10.0.0.0/16) with 2 public + 2 private subnets in 2 Availability Zones, ALB, Auto Scaling web servers,
+  Multi-AZ encrypted RDS MySQL, Secrets Manager, S3, AWS IoT Core things/policies, CloudWatch monitoring and VPC Flow Logs.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: smartsports
+    AllowedPattern: '^[a-z][a-z0-9-]{2,20}$'
+  ArtifactBucket:
+    Type: String
+    Description: Existing S3 bucket that holds the application zip (see docs/DEPLOYMENT.md step 1).
+  ArtifactKey:
+    Type: String
+    Default: artifacts/smartsports-app.zip
+  AlertEmail:
+    Type: String
+    Description: Email that receives CloudWatch alarm notifications (you must confirm the subscription).
+  AdminEmail:
+    Type: String
+    Default: admin@utem.edu.my
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 10
+    MaxLength: 40
+    AllowedPattern: '^[A-Za-z0-9#%*_+=!-]+$'
+    Description: First admin password (10 to 40 characters, no quotes or dollar signs). Stored in Secrets Manager.
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Who may reach the load balancer. Restrict this during development.
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN for HTTPS. Leave empty for an HTTP-only lab (NOT for production).
+  WebInstanceType:
+    Type: String
+    Default: t3.micro
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  MinSize:
+    Type: Number
+    Default: 2
+  MaxSize:
+    Type: Number
+    Default: 4
+  IotMode:
+    Type: String
+    Default: simulate
+    AllowedValues: [simulate, aws]
+  IotEndpoint:
+    Type: String
+    Default: ''
+    Description: "aws iot describe-endpoint --endpoint-type iot:Data-ATS (needed when IotMode=aws)"
+  EnableGuardDuty:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set true only if GuardDuty is not already enabled in this account and region.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  HasCert: !Not [!Equals [!Ref CertificateArn, '']]
+  NoCert: !Equals [!Ref CertificateArn, '']
+  UseGuardDuty: !Equals [!Ref EnableGuardDuty, 'true']
+
+Resources:
+  # ------------------------------------------------------------------ Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${ProjectName}-vpc'}]
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Sub '${ProjectName}-igw'}]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw}
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.0.1.0/24, AvailabilityZone: !Select [0, !GetAZs ''], MapPublicIpOnLaunch: false, Tags: [{Key: Name, Value: !Sub '${ProjectName}-public-1-az1'}]}
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.0.2.0/24, AvailabilityZone: !Select [0, !GetAZs ''], Tags: [{Key: Name, Value: !Sub '${ProjectName}-private-1-az1'}]}
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.0.3.0/24, AvailabilityZone: !Select [1, !GetAZs ''], MapPublicIpOnLaunch: false, Tags: [{Key: Name, Value: !Sub '${ProjectName}-public-2-az2'}]}
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.0.4.0/24, AvailabilityZone: !Select [1, !GetAZs ''], Tags: [{Key: Name, Value: !Sub '${ProjectName}-private-2-az2'}]}
+
+  NatEip1:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties: {Domain: vpc}
+  NatEip2:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties: {Domain: vpc}
+  Nat1:
+    Type: AWS::EC2::NatGateway
+    Properties: {AllocationId: !GetAtt NatEip1.AllocationId, SubnetId: !Ref PublicSubnet1, Tags: [{Key: Name, Value: !Sub '${ProjectName}-nat-az1'}]}
+  Nat2:
+    Type: AWS::EC2::NatGateway
+    Properties: {AllocationId: !GetAtt NatEip2.AllocationId, SubnetId: !Ref PublicSubnet2, Tags: [{Key: Name, Value: !Sub '${ProjectName}-nat-az2'}]}
+
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc, Tags: [{Key: Name, Value: !Sub '${ProjectName}-public-rt'}]}
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref PublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  PublicRt1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRt}
+  PublicRt2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRt}
+  PrivateRt1:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc, Tags: [{Key: Name, Value: !Sub '${ProjectName}-private-rt-az1'}]}
+  PrivateRt1Default:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivateRt1, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref Nat1}
+  PrivateRt1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRt1}
+  PrivateRt2:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc, Tags: [{Key: Name, Value: !Sub '${ProjectName}-private-rt-az2'}]}
+  PrivateRt2Default:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivateRt2, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref Nat2}
+  PrivateRt2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRt2}
+
+  # ------------------------------------------------------------------ Security groups (least privilege)
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internet to the load balancer (80 and 443 only)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AllowedCidr}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedCidr}
+      Tags: [{Key: Name, Value: !Sub '${ProjectName}-alb-sg'}]
+  WebSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web servers accept traffic from the load balancer only. No SSH, use SSM Session Manager.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref AlbSg}
+      Tags: [{Key: Name, Value: !Sub '${ProjectName}-web-sg'}]
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL reachable from the web servers only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref WebSg}
+      Tags: [{Key: Name, Value: !Sub '${ProjectName}-db-sg'}]
+
+  # ------------------------------------------------------------------ Monitoring: VPC Flow Logs
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/${ProjectName}/vpc-flow', RetentionInDays: 30}
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: vpc-flow-logs.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: write-flow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !GetAtt FlowLogGroup.Arn
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref Vpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/${ProjectName}/app', RetentionInDays: 30}
+
+  # ------------------------------------------------------------------ Storage: S3 (private, encrypted, versioned)
+  AppBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - {BucketKeyEnabled: true, ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - {Id: archive-old-files, Status: Enabled, Prefix: archives/, Transitions: [{StorageClass: GLACIER, TransitionInDays: 90}]}
+          - {Id: expire-old-versions, Status: Enabled, NoncurrentVersionExpiration: {NoncurrentDays: 90}, AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}}
+  AppBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AppBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt AppBucket.Arn, !Sub '${AppBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  # ------------------------------------------------------------------ Secrets
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/app'
+      Description: Session signing key (generated), first admin password and Telegram bot token
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"ADMIN_PASSWORD":"${AdminPassword}","TELEGRAM_BOT_TOKEN":""}'
+        GenerateStringKey: SESSION_SECRET
+        PasswordLength: 48
+        ExcludePunctuation: true
+  IotSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/iot-backend'
+      Description: X.509 certificate, private key and CA for the backend MQTT client. Fill after creating the certificate.
+      SecretString: '{"cert":"","key":"","ca":""}'
+
+  # ------------------------------------------------------------------ Database: RDS MySQL Multi-AZ, encrypted, private
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: {DBSubnetGroupDescription: Private subnets in both AZs, SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]}
+  DbParams:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Force TLS and enable the slow query log
+      Family: mysql8.0
+      Parameters: {require_secure_transport: '1', slow_query_log: '1', long_query_time: '2'}
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db'
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: true
+      DBName: smartsports
+      MasterUsername: smartadmin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSg]
+      DBParameterGroupName: !Ref DbParams
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      EnableCloudwatchLogsExports: [error, slowquery]
+      DeletionProtection: false
+
+  # ------------------------------------------------------------------ IAM for the web servers
+  WebRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: app-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!GetAtt Database.MasterUserSecret.SecretArn, !Ref AppSecret, !Ref IotSecret]
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: [!Sub '${AppBucket.Arn}/facilities/*', !Sub '${AppBucket.Arn}/receipts/*']
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ArtifactBucket}/${ArtifactKey}'
+  WebProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref WebRole]}
+
+  # ------------------------------------------------------------------ Load balancer
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref AlbSg]
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      LoadBalancerAttributes:
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true'}
+        - {Key: idle_timeout.timeout_seconds, Value: '60'}
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !Ref Vpc
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: {HttpCode: '200'}
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+  ListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCert
+          - {Type: redirect, RedirectConfig: {Protocol: HTTPS, Port: '443', StatusCode: HTTP_301}}
+          - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+  ListenerHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCert
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{CertificateArn: !Ref CertificateArn}]
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref TargetGroup}]
+
+  # ------------------------------------------------------------------ Web servers + Auto Scaling
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-web'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref WebInstanceType
+        IamInstanceProfile: {Arn: !GetAtt WebProfile.Arn}
+        SecurityGroupIds: [!Ref WebSg]
+        MetadataOptions: {HttpTokens: required, HttpEndpoint: enabled, HttpPutResponseHopLimit: 1}
+        Monitoring: {Enabled: true}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: {VolumeSize: 12, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{Key: Name, Value: !Sub '${ProjectName}-web'}]
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                set -euxo pipefail
+                timedatectl set-timezone Asia/Kuala_Lumpur
+                dnf install -y nodejs20 nodejs20-npm unzip amazon-cloudwatch-agent
+                mkdir -p /opt/smartsports /var/log/smartsports
+                id app || useradd --system --home-dir /opt/smartsports --shell /sbin/nologin app
+                aws s3 cp s3://${ArtifactBucket}/${ArtifactKey} /tmp/app.zip --region ${AWS::Region}
+                unzip -o /tmp/app.zip -d /opt/smartsports
+                curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /opt/smartsports/rds-global-bundle.pem
+                cd /opt/smartsports
+                npm install --omit=dev --no-audit --no-fund
+                cat > /etc/smartsports.env <<EOF
+                NODE_ENV=production
+                PORT=3000
+                TZ_OFFSET=+08:00
+                AWS_REGION=${AWS::Region}
+                DB_HOST=${Database.Endpoint.Address}
+                DB_NAME=smartsports
+                DB_SSL_CA=/opt/smartsports/rds-global-bundle.pem
+                DB_SECRET_ARN=${Database.MasterUserSecret.SecretArn}
+                APP_SECRET_ARN=${AppSecret}
+                IOT_SECRET_ARN=${IotSecret}
+                IOT_MODE=${IotMode}
+                IOT_ENDPOINT=${IotEndpoint}
+                S3_BUCKET=${AppBucket}
+                COOKIE_SECURE=${CookieSecure}
+                ALLOWED_EMAIL_DOMAIN=student.utem.edu.my
+                AUTO_INIT_DB=true
+                ADMIN_EMAIL=${AdminEmail}
+                RATE_LIMIT_PER_MIN=600
+                EOF
+                chmod 600 /etc/smartsports.env
+                chown -R app:app /opt/smartsports /var/log/smartsports
+                cat > /etc/systemd/system/smartsports.service <<EOF
+                [Unit]
+                Description=Smart Sports Booking web server
+                After=network-online.target
+                Wants=network-online.target
+                [Service]
+                User=app
+                WorkingDirectory=/opt/smartsports
+                EnvironmentFile=/etc/smartsports.env
+                ExecStart=/usr/bin/node server.js
+                Restart=always
+                RestartSec=3
+                StandardOutput=append:/var/log/smartsports/app.log
+                StandardError=append:/var/log/smartsports/app.log
+                NoNewPrivileges=true
+                PrivateTmp=true
+                ProtectSystem=full
+                [Install]
+                WantedBy=multi-user.target
+                EOF
+                cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<EOF
+                {"logs":{"logs_collected":{"files":{"collect_list":[{"file_path":"/var/log/smartsports/app.log","log_group_name":"/${ProjectName}/app","log_stream_name":"{instance_id}"}]}}},
+                 "metrics":{"append_dimensions":{"AutoScalingGroupName":"${!aws:AutoScalingGroupName}"},
+                  "metrics_collected":{"mem":{"measurement":["mem_used_percent"]},"disk":{"measurement":["used_percent"],"resources":["/"]}}}}
+                EOF
+                /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json -s
+                systemctl daemon-reload
+                systemctl enable --now smartsports
+              - CookieSecure: !If [HasCert, 'true', 'false']
+  WebAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [PrivateRt1Default, PrivateRt2Default]
+    UpdatePolicy:
+      AutoScalingRollingUpdate: {MinInstancesInService: 1, MaxBatchSize: 1, PauseTime: PT5M, WaitOnResourceSignals: false}
+    Properties:
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref MinSize
+      VPCZoneIdentifier: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      LaunchTemplate: {LaunchTemplateId: !Ref LaunchTemplate, Version: !GetAtt LaunchTemplate.LatestVersionNumber}
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 420
+      MetricsCollection: [{Granularity: 1Minute}]
+      Tags: [{Key: Name, Value: !Sub '${ProjectName}-web', PropagateAtLaunch: true}]
+  CpuScaling:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: {PredefinedMetricType: ASGAverageCPUUtilization}
+        TargetValue: 50
+  RequestScaling:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub '${Alb.LoadBalancerFullName}/${TargetGroup.TargetGroupFullName}'
+        TargetValue: 600
+
+  # ------------------------------------------------------------------ Detect: alarms, dashboard, GuardDuty
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: [{Endpoint: !Ref AlertEmail, Protocol: email}]
+  AlarmUnhealthy:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A web server failed its health check
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions: [{Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}, {Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+  AlarmAlb5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Many server errors (5xx) returned to students
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{Name: LoadBalancer, Value: !GetAtt Alb.LoadBalancerFullName}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  AlarmWebCpu:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Web tier CPU is high for 5 minutes (auto scaling should be reacting)
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{Name: AutoScalingGroupName, Value: !Ref WebAsg}]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlarmTopic]
+  AlarmDbCpu:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU is high
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{Name: DBInstanceIdentifier, Value: !Ref Database}]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlarmTopic]
+  AlarmDbStorage:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database free storage below 4 GB
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{Name: DBInstanceIdentifier, Value: !Ref Database}]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 4294967296
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlarmTopic]
+  LoginFailureFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref AppLogGroup
+      FilterPattern: '{ $.msg = "request_failed" }'
+      MetricTransformations: [{MetricName: ApplicationErrors, MetricNamespace: !Sub '${ProjectName}', MetricValue: '1'}]
+  AlarmAppErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The application logged repeated errors
+      Namespace: !Sub '${ProjectName}'
+      MetricName: ApplicationErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-overview'
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Requests and 5xx","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${Alb.LoadBalancerFullName}"],[".","HTTPCode_Target_5XX_Count",".","."]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Response time (p95) and healthy hosts","region":"${AWS::Region}","period":60,
+            "metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${Alb.LoadBalancerFullName}",{"stat":"p95"}],[".","HealthyHostCount","TargetGroup","${TargetGroup.TargetGroupFullName}","LoadBalancer","${Alb.LoadBalancerFullName}",{"stat":"Minimum","yAxis":"right"}]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Web servers: CPU and instance count","region":"${AWS::Region}","period":60,
+            "metrics":[["AWS/EC2","CPUUtilization","AutoScalingGroupName","${WebAsg}",{"stat":"Average"}],["AWS/AutoScaling","GroupInServiceInstances","AutoScalingGroupName","${WebAsg}",{"stat":"Average","yAxis":"right"}]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Database: CPU and connections","region":"${AWS::Region}","period":60,
+            "metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${Database}",{"stat":"Average"}],[".","DatabaseConnections",".",".",{"stat":"Average","yAxis":"right"}]]}}
+        ]}
+  GuardDuty:
+    Type: AWS::GuardDuty::Detector
+    Condition: UseGuardDuty
+    Properties: {Enable: true, FindingPublishingFrequency: FIFTEEN_MINUTES}
+
+  # ------------------------------------------------------------------ IoT Core: things and least-privilege policies
+  Relay01: {Type: 'AWS::IoT::Thing', Properties: {ThingName: RELAY_01}}
+  Relay02: {Type: 'AWS::IoT::Thing', Properties: {ThingName: RELAY_02}}
+  Relay03: {Type: 'AWS::IoT::Thing', Properties: {ThingName: RELAY_03}}
+  Relay04: {Type: 'AWS::IoT::Thing', Properties: {ThingName: RELAY_04}}
+  BackendThing: {Type: 'AWS::IoT::Thing', Properties: {ThingName: !Sub '${ProjectName}-backend'}}
+  DevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-device-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${!iot:Connection.Thing.ThingName}'
+            Condition: {Bool: {'iot:Connection.Thing.IsAttached': 'true'}}
+          - Effect: Allow
+            Action: iot:Publish
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/utem/sports/court/${!iot:Connection.Thing.ThingName}/ack'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/utem/sports/court/${!iot:Connection.Thing.ThingName}/heartbeat'
+          - Effect: Allow
+            Action: iot:Subscribe
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/utem/sports/court/${!iot:Connection.Thing.ThingName}/cmd'
+          - Effect: Allow
+            Action: iot:Receive
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/utem/sports/court/${!iot:Connection.Thing.ThingName}/cmd'
+  BackendPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-backend-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - {Effect: Allow, Action: 'iot:Connect', Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ProjectName}-backend-*'}
+          - {Effect: Allow, Action: 'iot:Publish', Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/utem/sports/court/*/cmd'}
+          - Effect: Allow
+            Action: iot:Subscribe
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/utem/sports/court/+/ack'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/utem/sports/court/+/heartbeat'
+          - Effect: Allow
+            Action: iot:Receive
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/utem/sports/court/*/ack'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/utem/sports/court/*/heartbeat'
+
+Outputs:
+  AppUrl:
+    Description: Open this address in the browser
+    Value: !If [HasCert, !Sub 'https://${Alb.DNSName}', !Sub 'http://${Alb.DNSName}']
+  LoadBalancerDns: {Value: !GetAtt Alb.DNSName}
+  DatabaseEndpoint: {Value: !GetAtt Database.Endpoint.Address}
+  DatabaseSecretArn: {Value: !GetAtt Database.MasterUserSecret.SecretArn}
+  AppSecretArn: {Value: !Ref AppSecret}
+  IotSecretArn: {Value: !Ref IotSecret}
+  FilesBucket: {Value: !Ref AppBucket}
+  DashboardName: {Value: !Sub '${ProjectName}-overview'}
+  AutoScalingGroup: {Value: !Ref WebAsg}

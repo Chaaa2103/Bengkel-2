@@ -1,0 +1,15 @@
+# Local MySQL 8 for development only.  docker compose up -d db
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: smartsports
+      MYSQL_USER: smart
+      MYSQL_PASSWORD: smartpass
+      TZ: Asia/Kuala_Lumpur
+    command: ["--default-time-zone=+08:00", "--character-set-server=utf8mb4"]
+    ports: ["3306:3306"]
+    volumes: ["dbdata:/var/lib/mysql"]
+volumes:
+  dbdata:
